@@ -1,0 +1,117 @@
+UNITY_PATH = "C:\Program Files\Unity\Hub\Editor\2022.3.19f1\Editor\Unity.exe"
+pipeline {
+    parameters {
+        choice(name: 'TYPE', choices: ['Debug', 'Release', 'Publisher'], description: 'Do you want cheats or speed?')
+        choice(name: 'BUILD', choices: ['Fast', 'Deploy', 'HealthCheck'], description: 'Fast builds run minimal tests and make a build. HealthCheck builds run more automated tests and are slower. Deploy builds are HealthChecks + a deploy.')
+        booleanParam(name: 'CLEAN', defaultValue: false, description: 'Tick to removed cached files - will take an eon')
+        booleanParam(name: 'SKIP_PLAYMODE_TESTS', defaultValue: false, description: 'In an emergency, to allow Deploy builds to work with a failing playmode test')
+    }
+    options {
+        timestamps()
+        // as a failsafe. our build tend around the 15min mark, so 45 would be excessive.
+        timeout(time: 45, unit: 'MINUTES')
+    }
+    // post stages only kick in once we definitely have a node
+    stages {
+        stage('Clean') {
+            when {
+                expression { return params.CLEAN }
+            }
+            steps {
+                bat "if exist Library (rmdir Library /s /q)"
+                bat "if exist Temp (rmdir Temp /s /q)"
+            }
+        }
+        stage('Prewarm') {
+            steps {
+                script {
+                    // not easy to get jenkins to tell us the current branch! none of the built-in envs seem to work?
+                    // let's just ask svn directly.
+                    def get_branch_script = 'svn info | select-string "Relative URL: \\^\\/(.*)" | %{\$_.Matches.Groups[1].Value}'
+                    env.R7_SVN_BRANCH = powershell(returnStdout: true, script:get_branch_script).trim()
+                }
+                buildName "${BUILD_NUMBER} - ${TYPE}@${env.R7_SVN_BRANCH}/${SVN_REVISION}"
+                script {
+                    if (params.BUILD == 'Deploy') {
+                        buildName "${env.BUILD_DISPLAY_NAME} ^Deploy"
+                    }
+                    if (params.BUILD == 'HealthCheck') {
+                        buildName "Health Check of ${TYPE}@${env.R7_SVN_BRANCH}/${SVN_REVISION}"
+                    }
+                    if (params.BUILD == 'HealthCheck' || params.BUILD == 'Deploy') {
+                        // let's warn that a deploy build is in progress
+                        slackSend color: 'good',
+                            message: ":hourglass: build ${env.BUILD_DISPLAY_NAME} STARTED (<${env.BUILD_URL}|Open>)",
+                            channel: "project_builds"
+                    }
+                }
+                // clean tests
+                bat "if exist *tests.xml (del *tests.xml)"
+                // need an initial open/close to clean out the serialisation. without this you can get things validating on old code!!
+                // do it twice, to make it more tolerant of bad libraries when switching branches
+                retry(count: 2) {
+                    bat "\"${UNITY_PATH}\" -nographics -buildTarget Win64 -quit -batchmode -projectPath . -executeMethod MyBuildFunction -MyBuildType \"${params.TYPE}\" -MyTestOnly -logFile"
+                }
+            }
+        }
+        stage ('Editmode Tests') {
+            steps {
+                bat "\"${UNITY_PATH}\" -nographics -batchmode -projectPath . -runTests -testResults editmodetests.xml -testPlatform editmode -logFile"
+            }
+        }
+        stage ('Playmode Tests') {
+            when {
+                expression {
+                    return (params.BUILD == 'Deploy' || params.BUILD == 'HealthCheck') && !params.SKIP_PLAYMODE_TESTS
+                }
+            }
+            steps {
+                // no -nographics on playmode tests. they don't log right now? which is weird cuz the editmode tests do with almost the same setup.
+                bat "\"${UNITY_PATH}\" -batchmode -projectPath . -runTests -testResults playmodetests.xml -testPlatform playmode -testCategory \"BuildServer\" -logFile"
+            }
+        }
+        stage ('Build') {
+            steps {
+                bat "\"${UNITY_PATH}\" -nographics -buildTarget Win64 -quit -batchmode -projectPath . -executeMethod MyBuildFunction  -MyBuildType \"${params.TYPE}\" -logFile"
+            }
+        }
+        stage ('Deploy') {
+            when {
+                expression { return params.BUILD == 'Deploy' }
+            }
+            steps {
+                // ... how to get a build to your platform of choice ...
+                slackSend color: 'good', message: ":ship: build ${env.BUILD_DISPLAY_NAME} DEPLOYED (<${env.BUILD_URL}|Open>)", channel: "project_builds"
+            }
+        }        
+    }
+    post {
+        always {
+            nunit testResultsPattern: '*tests.xml'
+        }
+        success {
+            script {
+                if (params.BUILD == 'HealthCheck') {
+                    slackSend color: 'good',
+                        message: ":green_heart: build ${env.BUILD_DISPLAY_NAME} SUCCEEDED (<${env.BUILD_URL}|Open>)",
+                        channel: "project_builds"
+                }
+            }
+        }
+        fixed {
+            slackSend color: 'good',
+                message: ":raised_hands: build ${env.BUILD_DISPLAY_NAME} FIXED (<${env.BUILD_URL}|Open>)",
+                channel: "project_builds"
+        }
+        aborted {
+            slackSend color: 'danger',
+                message: ":warning: build ${env.BUILD_DISPLAY_NAME} ABORTED. Was it intentional? (<${env.BUILD_URL}|Open>)",
+                channel: "project_builds"
+        }
+        failure {
+            slackSend color: 'danger',
+                message: ":red_circle: build ${env.BUILD_DISPLAY_NAME} FAILED (<${env.BUILD_URL}|Open>)",
+                channel: "project_builds"
+        }
+    }                    
+}
